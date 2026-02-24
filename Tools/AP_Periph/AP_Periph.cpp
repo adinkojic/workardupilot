@@ -567,6 +567,10 @@ void AP_Periph_FW::update()
 #if AP_PERIPH_BATTERY_BMS_ENABLED
     battery_bms.update();
 #endif
+
+#if AP_PERIPH_SINGLE_PHASE_BLDC
+    single_phase_bldc.update();
+#endif
 }
 
 #ifdef HAL_PERIPH_LISTEN_FOR_SERIAL_UART_REBOOT_CMD_PORT

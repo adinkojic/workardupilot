@@ -45,6 +45,7 @@
 #include "actuator_telem.h"
 #include "networking.h"
 #include "serial_options.h"
+#include "bldc_motor.h"
 #if AP_SIM_ENABLED
 #include <SITL/SITL.h>
 #endif
@@ -417,6 +418,10 @@ public:
 
 #if AP_PERIPH_BATTERY_BMS_ENABLED
     BatteryBMS battery_bms;
+#endif
+
+#if AP_PERIPH_SINGLE_PHASE_BLDC
+    SinglePhaseBLDC single_phase_bldc;
 #endif
 
 #if AP_PERIPH_ACTUATOR_TELEM_ENABLED

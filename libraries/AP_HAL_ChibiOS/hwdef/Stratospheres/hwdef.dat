@@ -72,6 +72,8 @@ define HAL_DEVICE_THREAD_STACK 768
 # we setup a small defaults.parm
 define AP_PARAM_MAX_EMBEDDED_PARAM 256
 
+#enable motor driver
+define AP_PERIPH_SINGLE_PHASE_BLDC 1
 
 # keep ROMFS uncompressed as we don't have enough RAM
 # to uncompress the bootloader at runtime
