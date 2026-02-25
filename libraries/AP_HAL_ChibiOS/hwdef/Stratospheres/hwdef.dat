@@ -38,9 +38,13 @@ I2C_ORDER I2C1
 PB10 LED OUTPUT HIGH
 define HAL_LED_ON 1
 
-#green LED, Power ON indicator, High ON
+#right LED, flashing, High ON
 PB11 TEST_LED OUTPUT HIGH GPIO(24)
 define GPIO_TEST_LED 24
+
+#deadman button, low pressed
+PA0 DEADMAN_BUTTON INPUT GPIO(8)
+define GPIO_DEADMAN_BUTTON 8
 
 # USART1, debug
 PA9  USART1_TX USART1
