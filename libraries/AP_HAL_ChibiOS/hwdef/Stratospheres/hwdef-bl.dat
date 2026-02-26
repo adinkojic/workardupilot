@@ -44,6 +44,30 @@ PA11 LED_GREEN OUTPUT HIGH
 PA0 DEADMAN_BUTTON INPUT GPIO(8)
 define GPIO_DEADMAN_BUTTON 8
 
+#SOT Hall effect
+PC4 MOTOR_A_PHASE INPUT GPIO(16)
+define GPIO_MOTOR_A_PHASE 16
+
+#nSleep pin for driver, High ON
+PA1 NSLEEP OUTPUT PUSHPULL LOW GPIO(9)
+define GPIO_NSLEEP 9
+
+#drive off pin for driver, High OFF
+PB14 DRVOFF OUTPUT PUSHPULL LOW GPIO(27)
+define GPIO_DRVOFF 27
+
+#enable pin for driver, High ON
+PB13 MOTOR_EN OUTPUT PUSHPULL LOW GPIO(26)
+define GPIO_MOTOR_EN 26
+
+#enable pin for driver, High ON
+PB12 MOTOR_PHASE OUTPUT PUSHPULL LOW GPIO(25)
+define GPIO_MOTOR_PHASE 25
+
+#motor fault button, low faulted
+PA3 MOTOR_FAULT INPUT GPIO(11)
+define GPIO_MOTOR_FAULT 11
+
 # I2C1 bus
 PB7 I2C1_SDA I2C1
 PA15 I2C1_SCL I2C1
@@ -65,6 +89,9 @@ define STM32_SERIAL_USE_USART3 FALSE
 define HAL_USE_EMPTY_IO TRUE
 
 define DMA_RESERVE_SIZE 0
+
+# Add CS pins to ensure they are high in bootloader
+PA4 MOTOR_CS CS
 
 # enable CAN support
 
