@@ -11,7 +11,8 @@ public:
     void init(void);
 
 private:
-    AP_HAL::OwnPtr<AP_HAL::SPIDevice> _spi;
-    bool clear_fault(void);
+    void blink_led(uint32_t now);
+    void clear_fault(void);
+    //AP_HAL::OwnPtr<AP_HAL::SPIDevice> _spi;
 };
 #endif
