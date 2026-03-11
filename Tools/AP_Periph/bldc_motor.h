@@ -13,6 +13,8 @@ public:
 private:
     void blink_led(uint32_t now);
     void clear_fault(void);
+    //void phase_thread(void);
     //AP_HAL::OwnPtr<AP_HAL::SPIDevice> _spi;
 };
+
 #endif

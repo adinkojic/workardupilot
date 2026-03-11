@@ -33,6 +33,8 @@ SERIAL_ORDER USART1
 # I2C buses
 I2C_ORDER I2C1
 
+define HAL_USE_GPT TRUE
+
 #timer for fast motor ops
 STM32_GPT_USE_TIM4 TRUE
 

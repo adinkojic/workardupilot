@@ -7,49 +7,39 @@
 
 #if AP_PERIPH_SINGLE_PHASE_BLDC
 #include "bldc_motor.h"
+#include <hal.h>
 
 extern const AP_HAL::HAL &hal;
 extern AP_Periph_FW periph;
 
-/*
-static void timer_callback(GPTDriver *gptp) {
-    // Called at 100 kHz from interrupt context
-    // Keep this extremely short — no allocation, no blocking
-    volatile static uint32_t counter = 0; //in 10s of ms
-    static uint32_t start_time = 0;
-    const uint32_t clear_time = 10; //10s of us
-    static bool clear_underway = false;
+// EN PWM duty cycle: 0-200 (0% - 100%), 200 steps per 1kHz cycle at 200kHz ISR rate
+static volatile uint8_t motor_en_duty = 50;  // 50% default
 
-    if(!clear_underway){
-        start_time = now;
-        clear_underway = true;
-    }
+static void motor_phase_isr(GPTDriver *gptp) {
+    static uint32_t ph_counter = 0;
+    static uint32_t en_counter = 0;
 
-    if(now - start_time < clear_time && clear_underway)
+    // Phase toggle
+    if(ph_counter == 0)
     {
-        hal.gpio->write(GPIO_NSLEEP, 0);
+        palToggleLine(HAL_GPIO_LINE_GPIO25);  // PB12 = MOTOR_PH
+        ph_counter = 6;
     }
-    else
-    {
-        hal.gpio->write(GPIO_NSLEEP, 1);
-        clear_underway = false;
-        return true;
-    }
+    ph_counter--;
 
-    counter++;
+    // Software PWM for EN pin at 1kHz (200 ticks @ 200kHz)
+    en_counter++;
+    if(en_counter >= 100) en_counter = 0;
+    palWriteLine(HAL_GPIO_LINE_GPIO26, en_counter < motor_en_duty ? PAL_HIGH : PAL_LOW);
 }
 
-static const GPTConfig gpt_cfg = {
-    .frequency = 1000000,   // 1 MHz timer clock
-    .callback  = timer_callback,
+static const GPTConfig gpt4_cfg = {
+    .frequency = 1000000,       // 1 MHz timer clock (prescaler = 160-1)
+    .callback  = motor_phase_isr,
     .cr2       = 0,
     .dier      = 0,
 };
 
-void start_100khz_timer() {
-    gptStart(&GPTD4, &gpt_cfg);          // use an available GPT driver
-    gptStartContinuous(&GPTD4, 10);      // 1 MHz / 10 = 100 kHz
-}*/
 
 void SinglePhaseBLDC::init()
 {
@@ -59,6 +49,9 @@ void SinglePhaseBLDC::init()
     hal.gpio->write(GPIO_MOTOR_MODE, 0);
 
     hal.gpio->write(GPIO_NSLEEP, 1);
+
+    gptStart(&GPTD4, &gpt4_cfg);
+    gptStartContinuous(&GPTD4, 5);  // 1MHz / 10 = 100 kHz
 }
 
 void SinglePhaseBLDC::blink_led(uint32_t now)
@@ -109,8 +102,8 @@ void SinglePhaseBLDC::update()
     }
     
     hal.gpio->write(GPIO_DRVOFF, !button_pressed);
-    hal.gpio->write(GPIO_MOTOR_EN, 1);
-    hal.gpio->write(GPIO_MOTOR_PH, 1);
+    
+    motor_en_duty = (loop_counter%10000 )*0.01;
 
     if(now - last_printed > 1000)
     {
