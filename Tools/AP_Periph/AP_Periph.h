@@ -46,6 +46,7 @@
 #include "networking.h"
 #include "serial_options.h"
 #include "bldc_motor.h"
+#include "abp2_pressure.h"
 #if AP_SIM_ENABLED
 #include <SITL/SITL.h>
 #endif
@@ -422,6 +423,10 @@ public:
 
 #if AP_PERIPH_SINGLE_PHASE_BLDC
     SinglePhaseBLDC single_phase_bldc;
+#endif
+
+#if AP_PERIPH_ABP2_PRESSURE_ENABLED
+    ABP2Pressure abp2_pressure;
 #endif
 
 #if AP_PERIPH_ACTUATOR_TELEM_ENABLED

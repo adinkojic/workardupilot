@@ -39,15 +39,17 @@ define HAL_USE_GPT TRUE
 STM32_GPT_USE_TIM4 TRUE
 
 # one SPI bus
-#PA5 SPI1_SCK SPI1
-#PA6 SPI1_MISO SPI1
-#PA7 SPI1_MOSI SPI1
+PA5 SPI1_SCK SPI1
+PA6 SPI1_MISO SPI1
+PA7 SPI1_MOSI SPI1
 
 # SPI CS
 #PA4 MOTOR_CS CS
+PC6 MPRLS_CS  CS
 
 # SPI devices
 #SPIDEV motor_driver SPI1 DEVID1 MOTOR_CS MODE0  1*MHZ  1*MHZ
+SPIDEV mprls SPI1 DEVID1 MPRLS_CS MODE0 800*KHZ 800*KHZ
 
 # LEDs
 # blue LED0 marked as ACT
@@ -86,22 +88,6 @@ define GPIO_MOTOR_EN 26
 PB12 MOTOR_PH OUTPUT LOW GPIO(25)
 define GPIO_MOTOR_PH 25
 
-#enable diag pin driver, low for retry
-PA4 MOTOR_DIAG OUTPUT LOW GPIO(12)
-define GPIO_MOTOR_DIAG 12
-
-#enable slew rate pin driver, low for high speed
-PA5 MOTOR_SR OUTPUT LOW GPIO(13)
-define GPIO_MOTOR_SR 13
-
-#enable itrip driver, low for unmonitored
-PA7 MOTOR_ITRIP OUTPUT LOW GPIO(15)
-define GPIO_MOTOR_ITRIP 15
-
-#enable mode pin driver, low for EN/PH
-PA6 MOTOR_MODE OUTPUT LOW GPIO(14)
-define GPIO_MOTOR_MODE 14
-
 #motor fault button, low faulted
 PA3 MOTOR_FAULT INPUT GPIO(11)
 define GPIO_MOTOR_FAULT 11
@@ -138,10 +124,19 @@ define HAL_DEVICE_THREAD_STACK 768
 define AP_PARAM_MAX_EMBEDDED_PARAM 256
 
 #enable motor driver
-define AP_PERIPH_SINGLE_PHASE_BLDC 1
+define AP_PERIPH_SINGLE_PHASE_BLDC 0
+
+# enable Honeywell ABP2DANT015PG2A3XX pressure sensor on I2C1
+define AP_PERIPH_ABP2_PRESSURE_ENABLED 1
 
 define AP_STATS_ENABLED 1
 
 # keep ROMFS uncompressed as we don't have enough RAM
 # to uncompress the bootloader at runtime
 env ROMFS_UNCOMPRESSED True
+
+
+
+# enable MPRLS baro backend and AP_Periph baro support
+define AP_BARO_MPRLS_ENABLED 1
+define AP_PERIPH_BARO_ENABLED 1

@@ -1,0 +1,114 @@
+# hw definition file for processing by chibios_pins.py
+# MCU class and specific type
+
+# MCU class and specific type
+MCU STM32G4xx STM32G474xx
+
+FLASH_RESERVE_START_KB 36
+
+STORAGE_FLASH_PAGE 16
+define HAL_STORAGE_SIZE 800
+
+# board ID. See Tools/AP_Bootloader/board_types.txt
+APJ_BOARD_ID AP_HW_SSI_Motor_Driver_1
+
+# setup build for a peripheral firmware
+env AP_PERIPH 1
+
+# crystal frequency
+OSCILLATOR_HZ 24000000
+
+define CH_CFG_ST_FREQUENCY 1000000
+
+# assume 512k flash part
+FLASH_SIZE_KB 512
+
+# console over USB CDC
+STDOUT_SERIAL SDU1
+STDOUT_BAUDRATE 57600
+
+# USB
+PA11 OTG_FS_DM OTG1
+PA12 OTG_FS_DP OTG1
+
+# order of UARTs (USB only)
+SERIAL_ORDER OTG1
+
+# I2C buses
+I2C_ORDER I2C1
+
+# LEDs
+# blue LED0 marked as ACT
+PB0 LED OUTPUT HIGH
+define HAL_LED_ON 1
+
+#right LED, flashing, High ON
+PB2 TEST_LED OUTPUT LOW GPIO(19)
+define GPIO_TEST_LED 19
+
+#deadman button, low pressed
+PB11 DEADMAN_BUTTON INPUT GPIO(24)
+define GPIO_DEADMAN_BUTTON 24
+
+#SOT Hall effect
+PB15 MOTOR_A_PHASE INPUT GPIO(28)
+define GPIO_MOTOR_A_PHASE 28
+
+#THT Hall effect
+PB8 MOTOR_B_PHASE INPUT GPIO(30)
+define GPIO_MOTOR_B_PHASE 30
+
+# H-bridge complementary PWM via TIM8 (160 MHz APB2 clock)
+# Leg A: PC6=AL (CH1, active-low), PC10=AH (CH1N, active-high)
+# Leg B: PB9=BL (CH3, active-low), PB1=BH  (CH3N, active-high)
+PC6  TIM8_CH1  TIM8
+PC10 TIM8_CH1N TIM8
+PB9  TIM8_CH3  TIM8
+PB1  TIM8_CH3N TIM8
+
+# USART1
+PA9  USART1_TX USART1
+PA10 USART1_RX USART1
+
+# I2C1 bus
+PB7 I2C1_SDA I2C1
+PA15 I2C1_SCL I2C1
+
+define HAL_I2C_INTERNAL_MASK 1
+
+# SWD debugging
+PA13 JTMS-SWDIO SWD
+PA14 JTCK-SWCLK SWD
+
+define HAL_USE_ADC FALSE
+define STM32_ADC_USE_ADC1 FALSE
+define HAL_DISABLE_ADC_DRIVER TRUE
+
+define DMA_RESERVE_SIZE 0
+
+# enable CAN support
+CAN_ORDER 2
+PB5 CAN2_RX CAN2
+PB6 CAN2_TX CAN2
+define HAL_CAN_POOL_SIZE 6000
+
+define HAL_DEVICE_THREAD_STACK 768
+
+# we setup a small defaults.parm
+define AP_PARAM_MAX_EMBEDDED_PARAM 256
+
+# enable H-bridge motor driver
+define AP_PERIPH_SINGLE_PHASE_BLDC 1
+
+# enable Honeywell ABP2DANT015PG2A3XX pressure sensor on I2C1
+define AP_PERIPH_ABP2_PRESSURE_ENABLED 1
+
+define AP_STATS_ENABLED 1
+
+# keep ROMFS uncompressed as we don't have enough RAM
+# to uncompress the bootloader at runtime
+env ROMFS_UNCOMPRESSED True
+
+# enable MPRLS baro backend and AP_Periph baro support
+define AP_BARO_MPRLS_ENABLED 1
+define AP_PERIPH_BARO_ENABLED 1

@@ -29,6 +29,7 @@ define CH_CFG_ST_FREQUENCY 1000000
 
 # SPI CS
 #PA4 MOTOR_CS CS
+PC6 MPRLS_CS  CS
 
 # order of UARTs
 SERIAL_ORDER USART1
@@ -62,22 +63,6 @@ define GPIO_DRVOFF 27
 #enable pin for driver, High ON
 PB13 MOTOR_EN OUTPUT LOW GPIO(26)
 define GPIO_MOTOR_EN 26
-
-#enable pin for driver, High ON
-PB12 MOTOR_PHASE OUTPUT LOW GPIO(25)
-define GPIO_MOTOR_PHASE 25
-
-#enable diag pin driver, low for retry
-PA4 MOTOR_DIAG OUTPUT LOW GPIO(12)
-define GPIO_MOTOR_DIAG 12
-
-#enable slew rate pin driver, low for high speed
-PA5 MOTOR_SR OUTPUT LOW GPIO(13)
-define GPIO_MOTOR_SR 13
-
-#enable itrip driver, low for unmonitored
-PA7 MOTOR_ITRIP OUTPUT LOW GPIO(15)
-define GPIO_MOTOR_ITRIP 15
 
 #enable mode pin driver, low for EN/PH
 PA6 MOTOR_MODE OUTPUT LOW GPIO(14)

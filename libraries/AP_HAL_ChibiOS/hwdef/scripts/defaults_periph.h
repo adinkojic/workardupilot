@@ -376,6 +376,15 @@
 #ifndef AP_PERIPH_ACTUATOR_TELEM_ENABLED
 #define AP_PERIPH_ACTUATOR_TELEM_ENABLED 0
 #endif
+#ifndef AP_PERIPH_SINGLE_PHASE_BLDC
+#define AP_PERIPH_SINGLE_PHASE_BLDC 0
+#endif
+#ifndef AP_PERIPH_ABP2_PRESSURE_ENABLED
+#define AP_PERIPH_ABP2_PRESSURE_ENABLED 0
+#endif 
+#ifndef AP_BARO_MPRLS_ENABLED
+#define AP_BARO_MPRLS_ENABLED 0
+#endif 
 
 /*
  * turning on of ArduPilot features based on which AP_Periph features

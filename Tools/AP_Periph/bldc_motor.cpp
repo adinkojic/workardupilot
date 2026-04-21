@@ -1,5 +1,33 @@
 /*
-    DRV8243HQRXYRQ1 driver for a single phase brushless DC motor, HW mode
+    Single-phase BLDC H-bridge driver using TIM8 complementary PWM + predriver.
+
+    All four MCU outputs are active-high; the predriver converts them to the
+    correct gate voltages for the H-bridge MOSFETs.
+
+    Pin mapping (TIM8, 160 MHz APB2 clock):
+      PC6  = TIM8_CH1  = AL  (Leg A low-side,  CC1P=0: active-high → predriver)
+      PC10 = TIM8_CH1N = AH  (Leg A high-side, CC1NP=0: active-high → predriver)
+      PB9  = TIM8_CH3  = BL  (Leg B low-side,  CC3P=0: active-high → predriver)
+      PB1  = TIM8_CH3N = BH  (Leg B high-side, CC3NP=0: active-high → predriver)
+
+    With CC1P=0 (active-high on AL), leg A's CCR polarity is opposite to leg B:
+      Forward:  CCR1 = ARR−duty (AH on for duty/ARR), CCR3 = duty (BL on for duty/ARR)
+      Reverse:  CCR1 = duty     (AL on for duty/ARR), CCR3 = ARR−duty (BH on for duty/ARR)
+
+    Dead time: DEAD_TIME_TICKS inserted by TIM8 BDTR (MCU-side).
+               Total system dead time = MCU dead time + predriver propagation delay.
+    Bridge off: MOE=0, all outputs held LOW.
+
+    Operating modes:
+      STARTUP – 50 ms kick pulse, then hall-commuted open-loop spin-up until
+                STARTUP_RPM_THRESHOLD.
+      PID     – hall commutation continues in the 100 kHz ISR; main loop runs
+                PID to set duty cycle.
+
+    Hall sensor (PC4 / GPIO_MOTOR_A_PHASE) is polled by a 100 kHz TIM4 GPT
+    callback.  Each edge triggers an immediate H-bridge direction update and
+    records the half-period for RPM measurement.  The 1 kHz main loop only
+    needs to compute RPM and run the PID — no commutation timing constraint.
 */
 
 #include "AP_Periph.h"
@@ -7,185 +35,321 @@
 
 #if AP_PERIPH_SINGLE_PHASE_BLDC
 #include "bldc_motor.h"
-#include <hal.h>
 
 extern const AP_HAL::HAL &hal;
-extern AP_Periph_FW periph;
 
-// MOTOR_B_PHASE = PB0 (hall effect sensor)
-#define MOTOR_B_PHASE_LINE HAL_GPIO_LINE_GPIO17
+#define TIM8_CLK_HZ     160000000UL
+#define DEFAULT_FREQ_HZ 20000UL
+#define DEAD_TIME_TICKS 80U          // 500 ns @ 160 MHz
 
-// Motor states
-enum MotorState : uint8_t {
-    MOTOR_STOPPED,
-    MOTOR_STARTUP,   // pre-position rotor to a known pole before commutating
-    MOTOR_RUNNING,
-};
+// Hall sensor line — resolved from hwdef (StratospheresBBLE2: PB15)
+#define HALL_LINE HAL_GPIO_PIN_MOTOR_A_PHASE
 
-// 50 ms pre-position kick at 200 kHz ISR rate
-#define STARTUP_TICKS 10000U
+// Bridge idle: dead-time + off-state drive, no MOE
+static const uint32_t BDTR_BASE = TIM_BDTR_OSSR | TIM_BDTR_OSSI | DEAD_TIME_TICKS;
 
-// Shared state between ISR and main thread
-static volatile uint8_t    motor_en_duty     = 0;      // 0–100 (%)
-static volatile MotorState motor_state       = MOTOR_STOPPED;
-static volatile uint32_t   startup_remaining = 0;      // ticks left in startup phase
-static volatile uint32_t   hall_edge_count   = 0;      // total transitions, wraps
-static volatile uint32_t   half_period_ticks = 0;      // ISR ticks between last two hall edges
+// ---------------------------------------------------------------------------
+// ISR-shared state  (written/read from the 100 kHz TIM4 callback)
+// ---------------------------------------------------------------------------
 
-static void motor_phase_isr(GPTDriver *gptp) {
-    static uint32_t en_counter       = 0;
-    static uint32_t ticks_since_edge = 0;
-    static bool     last_hall        = false;
+// ISR fires at 100 kHz → 10 µs per tick.
+// At 500 000 electrical RPM: half-period ≈ 60 µs → ~6 ticks — well resolved.
+#define ISR_TICK_US        10U
+#define RPM_TIMEOUT_TICKS  (RPM_TIMEOUT_US / ISR_TICK_US)   // 50 000 ticks
 
-    bool hall = palReadLine(MOTOR_B_PHASE_LINE);
+static volatile uint32_t s_tick              = 0;    // monotonic ISR tick counter
+static volatile uint32_t s_half_period_ticks = 0;    // ticks between last two edges
+static volatile uint32_t s_last_edge_tick    = 0;    // tick of most recent edge
+static volatile bool     s_last_hall         = false;
+static volatile bool     s_commutate_en      = false; // ISR commutation active
+static volatile int8_t   s_direction         = 1;    // current H-bridge polarity
+static volatile float    s_throttle_v        = 0.0f; // mirrored for ISR
+static volatile uint32_t s_arr_v             = 4000U; // mirrored for ISR
 
-    // --- Commutation state machine ---
-    switch (motor_state) {
-    case MOTOR_STOPPED:
-        palWriteLine(HAL_GPIO_LINE_GPIO25, PAL_LOW);
-        break;
-    case MOTOR_STARTUP:
-        // Force PH HIGH to snap rotor to a known position before commutating
-        palWriteLine(HAL_GPIO_LINE_GPIO25, PAL_HIGH);
-        if (--startup_remaining == 0) {
-            motor_state = MOTOR_RUNNING;
+// 100 kHz TIM4 ISR — direct register access, no GPT driver needed.
+// APB1 = 160 MHz (PPRE1=DIV1): PSC=159 → 1 MHz counter, ARR=9 → 10 µs period.
+CH_IRQ_HANDLER(STM32_TIM4_HANDLER)
+{
+    CH_IRQ_PROLOGUE();
+    TIM4->SR = 0;   // clear update flag
+
+    s_tick++;
+
+    bool hall = (palReadLine(HALL_LINE) != 0);
+
+    if (hall != s_last_hall) {
+        uint32_t dt = s_tick - s_last_edge_tick;
+        if (dt > 0) {
+            s_half_period_ticks = dt;
         }
-        break;
-    case MOTOR_RUNNING:
-        palWriteLine(HAL_GPIO_LINE_GPIO25, hall ? PAL_HIGH : PAL_LOW);  // MOTOR_PH
-        break;
+        s_last_edge_tick = s_tick;
+        s_last_hall      = hall;
+
+        if (s_commutate_en) {
+            s_direction   = hall ? 1 : -1;
+            uint32_t arr  = s_arr_v;
+            uint32_t duty = (uint32_t)(s_throttle_v * arr);
+            // Leg A (CC1P=0): AH on when CNT >= CCR1 → CCR1 = arr-duty for forward
+            // Leg B (CC3P=0): BL on when CNT <  CCR3 → CCR3 = duty for forward
+            TIM8->CCR1 = (s_direction > 0) ? (arr - duty) : duty;
+            TIM8->CCR3 = (s_direction > 0) ? duty         : (arr - duty);
+        }
     }
 
-    // --- RPM measurement: time hall edges in ISR ticks ---
-    ticks_since_edge++;
-    if (hall != last_hall) {
-        half_period_ticks = ticks_since_edge;
-        ticks_since_edge  = 0;
-        hall_edge_count++;
-        last_hall = hall;
-    }
-
-    // --- EN software PWM at ~2 kHz (100 ticks @ 200 kHz) ---
-    en_counter++;
-    if (en_counter >= 100) en_counter = 0;
-    bool en_on = (motor_state != MOTOR_STOPPED) && (en_counter < (uint32_t)motor_en_duty);
-    palWriteLine(HAL_GPIO_LINE_GPIO26, en_on ? PAL_HIGH : PAL_LOW);    // MOTOR_EN
+    CH_IRQ_EPILOGUE();
 }
 
-static const GPTConfig gpt4_cfg = {
-    .frequency = 1000000,       // 1 MHz timer clock → ISR at 200 kHz (period = 5)
-    .callback  = motor_phase_isr,
-    .cr2       = 0,
-    .dier      = 0,
-};
+static void tim4_init()
+{
+    rccEnableTIM4(true);
+    TIM4->CR1  = 0;
+    TIM4->PSC  = 159U;           // 160 MHz / 160 = 1 MHz counter clock
+    TIM4->ARR  = 9U;             // 1 MHz / 10 = 100 kHz update event
+    TIM4->DIER = TIM_DIER_UIE;   // enable update interrupt
+    TIM4->EGR  = TIM_EGR_UG;    // load PSC/ARR immediately
+    TIM4->SR   = 0;
+    TIM4->CR1  = TIM_CR1_CEN;
+    nvicEnableVector(TIM4_IRQn, STM32_IRQ_TIM4_PRIORITY);
+}
 
+// ---------------------------------------------------------------------------
+// TIM8 helpers
+// ---------------------------------------------------------------------------
+
+// Writes TIM8 CCRs from current _throttle / s_direction and syncs volatile mirrors.
+void SinglePhaseBLDC::ccr_apply()
+{
+    s_throttle_v  = _throttle;
+    s_arr_v       = _arr;
+    uint32_t duty = (uint32_t)(_throttle * _arr);
+    // Leg A (CC1P=0): AH on when CNT >= CCR1 → CCR1 = arr-duty for forward
+    // Leg B (CC3P=0): BL on when CNT <  CCR3 → CCR3 = duty for forward
+    TIM8->CCR1 = (s_direction > 0) ? (_arr - duty) : duty;
+    TIM8->CCR3 = (s_direction > 0) ? duty          : (_arr - duty);
+}
+
+static void tim8_init(uint32_t arr)
+{
+    rccEnableTIM8(true);
+
+    TIM8->CR1  = 0;
+    TIM8->CR2  = 0;   // OIS = 0: idle state LOW for all channels
+    TIM8->SMCR = 0;
+
+    // Center-aligned mode 1, auto-reload preload enabled
+    TIM8->CR1 = TIM_CR1_CMS_0 | TIM_CR1_ARPE;
+
+    TIM8->PSC = 0;
+    TIM8->ARR = arr - 1;
+    TIM8->RCR = 0;
+
+    // CH1 and CH3: PWM mode 1, preload enable
+    TIM8->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE;
+    TIM8->CCMR2 = (6U << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
+
+    TIM8->CCR1 = 0;
+    TIM8->CCR3 = 0;
+
+    // All outputs active-high; predriver handles gate voltage conversion.
+    // CC1P=0: CH1 (AL) active-high; CC1NP=0: CH1N (AH) active-high complement.
+    // CC3P=0: CH3 (BL) active-high; CC3NP=0: CH3N (BH) active-high complement.
+    TIM8->CCER = TIM_CCER_CC1E | TIM_CCER_CC1NE |
+                 TIM_CCER_CC3E | TIM_CCER_CC3NE;
+
+    TIM8->BDTR = BDTR_BASE;   // bridge off
+    TIM8->EGR  = TIM_EGR_UG;
+    TIM8->SR   = 0;
+    TIM8->CR1 |= TIM_CR1_CEN;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 void SinglePhaseBLDC::init()
 {
-    hal.gpio->write(GPIO_MOTOR_DIAG,  0);
-    hal.gpio->write(GPIO_MOTOR_SR,    1);
-    hal.gpio->write(GPIO_MOTOR_ITRIP, 0);
-    hal.gpio->write(GPIO_MOTOR_MODE,  0);
-    hal.gpio->write(GPIO_NSLEEP,      1);
+    _arr   = TIM8_CLK_HZ / (2U * DEFAULT_FREQ_HZ);
+    s_arr_v = _arr;
+    tim8_init(_arr);
+    ccr_apply();
 
-    gptStart(&GPTD4, &gpt4_cfg);
-    gptStartContinuous(&GPTD4, 5);  // 1 MHz / 5 = 200 kHz ISR
+    tim4_init();
 }
 
-// throttle: 0.0 (stop) … 1.0 (full speed)
+void SinglePhaseBLDC::set_enabled(bool en)
+{
+    _enabled   = en;
+    TIM8->BDTR = en ? (BDTR_BASE | TIM_BDTR_MOE) : BDTR_BASE;
+}
+
 void SinglePhaseBLDC::set_throttle(float throttle)
 {
-    throttle = constrain_float(throttle, 0.0f, 1.0f);
-    motor_en_duty = (uint8_t)(throttle * 100.0f);
+    _throttle = constrain_float(throttle, 0.0f, 1.0f);
+    ccr_apply();
+}
 
-    if (throttle > 0.0f) {
-        // Only trigger startup sequence if currently stopped
-        if (motor_state == MOTOR_STOPPED) {
-            startup_remaining = STARTUP_TICKS;
-            motor_state = MOTOR_STARTUP;
+void SinglePhaseBLDC::set_frequency(uint32_t hz)
+{
+    _arr      = TIM8_CLK_HZ / (2U * hz);
+    TIM8->ARR = _arr - 1;
+    ccr_apply();
+    TIM8->EGR = TIM_EGR_UG;
+    TIM8->SR  = 0;
+}
+
+void SinglePhaseBLDC::flip_direction()
+{
+    // Disable bridge, swap phase, reset counter — also updates s_direction
+    TIM8->BDTR = BDTR_BASE;
+    s_direction = -s_direction;
+    ccr_apply();
+    TIM8->EGR  = TIM_EGR_UG;
+    TIM8->SR   = 0;
+}
+
+// ---------------------------------------------------------------------------
+// RPM (called from main loop — reads ISR volatile state)
+// ---------------------------------------------------------------------------
+
+void SinglePhaseBLDC::compute_rpm()
+{
+    // Snapshot volatile ISR state; minor race is acceptable (one-tick error max)
+    uint32_t half_ticks  = s_half_period_ticks;
+    uint32_t age_ticks   = s_tick - s_last_edge_tick;
+
+    if (half_ticks == 0 || age_ticks >= RPM_TIMEOUT_TICKS) {
+        _actual_rpm = 0.0f;
+        return;
+    }
+    // Two edges per electrical cycle
+    float period_s = 2.0f * half_ticks * ISR_TICK_US * 1e-6f;
+    _actual_rpm = 60.0f / (period_s * POLE_PAIRS);
+}
+
+// ---------------------------------------------------------------------------
+// Mode state machines (called from main loop at ~1 kHz)
+// ---------------------------------------------------------------------------
+
+void SinglePhaseBLDC::update_startup()
+{
+    if (!_kick_done) {
+        // Phase 1: fixed-direction kick to break static friction
+        if (_kick_start_ms == 0) {
+            _kick_start_ms = AP_HAL::millis();
         }
+        s_commutate_en = false;
+        set_throttle(STARTUP_KICK_THROTTLE);
+        set_enabled(true);
+        if (AP_HAL::millis() - _kick_start_ms >= STARTUP_KICK_MS) {
+            _kick_done = true;
+        }
+        return;
+    }
+
+    // Phase 2: ISR handles commutation; main loop just holds throttle
+    s_commutate_en = true;
+    set_throttle(STARTUP_COMMUTE_THROTTLE);
+    set_enabled(true);
+
+    if (_actual_rpm >= STARTUP_RPM_THRESHOLD) {
+        _mode          = DriveMode::PID;
+        _pid_integral  = 0.0f;
+        _pid_last_err  = TARGET_RPM - _actual_rpm;
+        _pid_last_us   = AP_HAL::micros();
+    }
+}
+
+void SinglePhaseBLDC::update_pid()
+{
+    // ISR continues handling commutation; PID controls duty cycle only
+    s_commutate_en = true;
+    set_enabled(true);
+
+    uint32_t now_us = AP_HAL::micros();
+    float dt = (now_us - _pid_last_us) * 1e-6f;
+    _pid_last_us = now_us;
+
+    if (dt <= 0.0f || dt > 0.5f) {
+        return;
+    }
+
+    float err      = TARGET_RPM - _actual_rpm;
+    _pid_integral += err * dt;
+    _pid_integral  = constrain_float(_pid_integral,
+                                     -PID_INTEGRAL_MAX, PID_INTEGRAL_MAX);
+    float deriv    = (err - _pid_last_err) / dt;
+    _pid_last_err  = err;
+
+    float duty = PID_KP * err + PID_KI * _pid_integral + PID_KD * deriv;
+    set_throttle(constrain_float(duty, 0.0f, 1.0f));
+}
+
+void SinglePhaseBLDC::update_stopping()
+{
+    // Keep commutating while the rotor is still spinning
+    s_commutate_en = true;
+    set_enabled(true);
+
+    float elapsed_s = (AP_HAL::millis() - _stop_start_ms) * 1e-3f;
+    float ramp_s    = STOP_RAMP_MS * 1e-3f;
+    float duty      = _stop_start_throttle * (1.0f - elapsed_s / ramp_s);
+
+    if (duty <= 0.0f) {
+        set_throttle(0.0f);
+        set_enabled(false);
+        s_commutate_en = false;
+        // Reset so the next button press starts fresh
+        _mode          = DriveMode::IDLE;
+        _kick_done     = false;
+        _kick_start_ms = 0;
+        _pid_integral  = 0.0f;
     } else {
-        motor_state = MOTOR_STOPPED;
+        set_throttle(duty);
     }
 }
 
-// Returns RPM estimate based on hall edge timing.
-// pole_pairs must be set correctly (default 1).
-// Returns 0 if the motor is stopped or no edges have been seen.
-uint32_t SinglePhaseBLDC::get_rpm() const
-{
-    if (motor_state != MOTOR_RUNNING) return 0;
-    uint32_t hp = half_period_ticks;    // snapshot volatile once
-    if (hp == 0) return 0;
-    // Each ISR tick = 5 µs (200 kHz).
-    // One revolution = 2 * pole_pairs hall edges → 2 * pole_pairs half-periods.
-    // RPM = 60,000,000 / (hp * 5µs * 2 * pole_pairs) = 6,000,000 / (hp * pole_pairs)
-    return 6000000UL / (hp * pole_pairs);
-}
-
-void SinglePhaseBLDC::blink_led(uint32_t now)
-{
-    uint16_t cycle_time = 1000;
-    uint16_t on_time = 500;
-    switch (motor_state) {
-        case MOTOR_STOPPED:
-            //default
-            break;
-        case MOTOR_STARTUP:
-            cycle_time = 200;
-            on_time = 20;
-            break;
-        case MOTOR_RUNNING:
-            cycle_time = 1000;
-            on_time = 900;
-            break;
-    }
-    hal.gpio->write(GPIO_TEST_LED, (now % cycle_time < on_time) ? 1 : 0);
-}
-
-void SinglePhaseBLDC::clear_fault()
-{
-    hal.gpio->write(GPIO_NSLEEP, 0);
-    uint32_t start = AP_HAL::micros();
-    while (AP_HAL::micros() - start < 5) {}
-    hal.gpio->write(GPIO_NSLEEP, 1);
-}
+// ---------------------------------------------------------------------------
+// Main update (called from AP_Periph loop at ~1 kHz)
+// ---------------------------------------------------------------------------
 
 void SinglePhaseBLDC::update()
 {
-    static uint32_t last_clr_fault = 0;
-    static uint32_t last_printed   = 0;
-    static bool     inited         = false;
-
-    uint32_t now = AP_HAL::millis();
-
+    static bool inited = false;
     if (!inited) {
         init();
         inited = true;
     }
 
-    bool button_pressed = (hal.gpio->read(GPIO_DEADMAN_BUTTON) == 0);
-    bool motor_faulted  = (hal.gpio->read(GPIO_MOTOR_FAULT)    == 0);
+    // Low = pressed
+    bool deadman = (hal.gpio->read(GPIO_DEADMAN_BUTTON) == 0);
 
-    if (motor_faulted && (now - last_clr_fault > 100)) {
-        clear_fault();
-        last_clr_fault = now;
+    compute_rpm();
+
+    // Deadman released mid-run → begin controlled ramp-down
+    if (!deadman && (_mode == DriveMode::STARTUP || _mode == DriveMode::PID)) {
+        _mode                = DriveMode::STOPPING;
+        _stop_start_ms       = AP_HAL::millis();
+        _stop_start_throttle = _throttle;
     }
 
-    hal.gpio->write(GPIO_DRVOFF, !button_pressed);
-
-    set_throttle(button_pressed ? 1.0f : 0.0f);
-
-    if (now - last_printed > 1000) {
-        can_printf("RPM: %u  fault: %d  throttle: %u%%  hall_edges: %u",
-                   (unsigned)get_rpm(),
-                   (int)motor_faulted,
-                   (unsigned)motor_en_duty,
-                   (unsigned)hall_edge_count);
-        last_printed = now;
+    switch (_mode) {
+    case DriveMode::IDLE:
+        // Wait for button press, bridge stays off
+        if (deadman) {
+            _mode = DriveMode::STARTUP;
+        }
+        break;
+    case DriveMode::STARTUP:  update_startup();  break;
+    case DriveMode::PID:      update_pid();      break;
+    case DriveMode::STOPPING: update_stopping(); break;
     }
 
-    blink_led(now);
+    blink_led(_mode == DriveMode::PID);
+}
+
+void SinglePhaseBLDC::blink_led(bool on)
+{
+    hal.gpio->write(GPIO_TEST_LED, on);
 }
 
 #endif

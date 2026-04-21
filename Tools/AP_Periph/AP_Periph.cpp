@@ -571,6 +571,10 @@ void AP_Periph_FW::update()
 #if AP_PERIPH_SINGLE_PHASE_BLDC
     single_phase_bldc.update();
 #endif
+
+#if AP_PERIPH_ABP2_PRESSURE_ENABLED
+    abp2_pressure.update();
+#endif
 }
 
 #ifdef HAL_PERIPH_LISTEN_FOR_SERIAL_UART_REBOOT_CMD_PORT

@@ -29,6 +29,16 @@ void AP_Periph_FW::can_baro_update(void)
     const float press = baro.get_pressure();
     const float temp = baro.get_temperature();
 
+    static uint32_t last_baro_print_ms;
+    const uint32_t now = AP_HAL::millis();
+    if (now - last_baro_print_ms >= 1000) {
+        last_baro_print_ms = now;
+        can_printf("MPRLS: P=%.0f Pa (%.2f PSI) T=%.1f C",
+                   (double)press,
+                   (double)(press / 6894.757f),
+                   (double)temp);
+    }
+
     {
         uavcan_equipment_air_data_StaticPressure pkt {};
         pkt.static_pressure = press;
