@@ -10,9 +10,19 @@
       PB9  = TIM8_CH3  = BL  (Leg B low-side,  CC3P=0: active-high → predriver)
       PB1  = TIM8_CH3N = BH  (Leg B high-side, CC3NP=0: active-high → predriver)
 
-    With CC1P=0 (active-high on AL), leg A's CCR polarity is opposite to leg B:
-      Forward:  CCR1 = ARR−duty (AH on for duty/ARR), CCR3 = duty (BL on for duty/ARR)
-      Reverse:  CCR1 = duty     (AL on for duty/ARR), CCR3 = ARR−duty (BH on for duty/ARR)
+    CH1 uses PWM mode 1 (OCref=1 when CNT < CCR), CH3 uses PWM mode 2 (OCref=1
+    when CNT >= CCR).  Both legs therefore assert their active switch in the same
+    region of the centre-aligned triangle wave, giving simultaneous conduction:
+
+      Forward (dir=+1): CCR1=CCR3 = ARR−duty
+        → AH+BL both HIGH when CNT >= ARR−duty  (active, duty/ARR fraction)
+        → AL+BH both HIGH when CNT <  ARR−duty  (synchronous freewheeling)
+
+      Reverse (dir=−1): CCR1=CCR3 = duty
+        → AL+BH both HIGH when CNT <  duty      (active, duty/ARR fraction)
+        → AH+BL both HIGH when CNT >= duty      (synchronous freewheeling)
+
+    Dead time on each half-bridge is enforced independently by TIM8 BDTR.
 
     Dead time: DEAD_TIME_TICKS inserted by TIM8 BDTR (MCU-side).
                Total system dead time = MCU dead time + predriver propagation delay.
@@ -37,6 +47,7 @@
 #include "bldc_motor.h"
 
 extern const AP_HAL::HAL &hal;
+extern AP_Periph_FW periph;
 
 #define TIM8_CLK_HZ     160000000UL
 #define DEFAULT_FREQ_HZ 20000UL
@@ -89,10 +100,9 @@ CH_IRQ_HANDLER(STM32_TIM4_HANDLER)
             s_direction   = hall ? 1 : -1;
             uint32_t arr  = s_arr_v;
             uint32_t duty = (uint32_t)(s_throttle_v * arr);
-            // Leg A (CC1P=0): AH on when CNT >= CCR1 → CCR1 = arr-duty for forward
-            // Leg B (CC3P=0): BL on when CNT <  CCR3 → CCR3 = duty for forward
-            TIM8->CCR1 = (s_direction > 0) ? (arr - duty) : duty;
-            TIM8->CCR3 = (s_direction > 0) ? duty         : (arr - duty);
+            uint32_t ccr  = (s_direction > 0) ? (arr - duty) : duty;
+            TIM8->CCR1    = ccr;
+            TIM8->CCR3    = ccr;
         }
     }
 
@@ -122,10 +132,11 @@ void SinglePhaseBLDC::ccr_apply()
     s_throttle_v  = _throttle;
     s_arr_v       = _arr;
     uint32_t duty = (uint32_t)(_throttle * _arr);
-    // Leg A (CC1P=0): AH on when CNT >= CCR1 → CCR1 = arr-duty for forward
-    // Leg B (CC3P=0): BL on when CNT <  CCR3 → CCR3 = duty for forward
-    TIM8->CCR1 = (s_direction > 0) ? (_arr - duty) : duty;
-    TIM8->CCR3 = (s_direction > 0) ? duty          : (_arr - duty);
+    // Forward: CCR = ARR-duty → AH+BL active when CNT >= CCR (top of triangle)
+    // Reverse: CCR = duty    → AL+BH active when CNT <  CCR (bottom of triangle)
+    uint32_t ccr  = (s_direction > 0) ? (_arr - duty) : duty;
+    TIM8->CCR1    = ccr;
+    TIM8->CCR3    = ccr;
 }
 
 static void tim8_init(uint32_t arr)
@@ -143,9 +154,11 @@ static void tim8_init(uint32_t arr)
     TIM8->ARR = arr - 1;
     TIM8->RCR = 0;
 
-    // CH1 and CH3: PWM mode 1, preload enable
+    // CH1: PWM mode 1 (OCref=1 when CNT < CCR) — AH active in top region
+    // CH3: PWM mode 2 (OCref=1 when CNT >= CCR) — BL active in top region
+    // Both channels share the same CCR value so AH+BL (or AL+BH) overlap exactly.
     TIM8->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE;
-    TIM8->CCMR2 = (6U << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
+    TIM8->CCMR2 = (7U << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
 
     TIM8->CCR1 = 0;
     TIM8->CCR3 = 0;
@@ -174,6 +187,8 @@ void SinglePhaseBLDC::init()
     ccr_apply();
 
     tim4_init();
+
+    set_test_mode(true);
 }
 
 void SinglePhaseBLDC::set_enabled(bool en)
@@ -309,6 +324,35 @@ void SinglePhaseBLDC::update_stopping()
 }
 
 // ---------------------------------------------------------------------------
+// Test mode (called from main loop at ~1 kHz)
+// Bridge follows the deadman button directly; each press flips direction.
+// No hall commutation or PID — purely for H-bridge verification.
+// ---------------------------------------------------------------------------
+
+void SinglePhaseBLDC::update_test()
+{
+    bool deadman = (hal.gpio->read(GPIO_DEADMAN_BUTTON) == 0);
+
+    // Rising edge: flip direction before enabling so the first energisation
+    // goes in the new direction.
+    if (deadman && !_prev_deadman) {
+        s_direction = -s_direction;
+        s_commutate_en = false;
+        set_throttle(TEST_THROTTLE);
+        ccr_apply();
+    }
+    _prev_deadman = deadman;
+
+    if (deadman) {
+        set_enabled(true);
+    } else {
+        set_enabled(false);
+        set_throttle(0.0f);
+        _mode = DriveMode::IDLE;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main update (called from AP_Periph loop at ~1 kHz)
 // ---------------------------------------------------------------------------
 
@@ -325,7 +369,7 @@ void SinglePhaseBLDC::update()
 
     compute_rpm();
 
-    // Deadman released mid-run → begin controlled ramp-down
+    // Deadman released mid-run → begin controlled ramp-down (normal modes only)
     if (!deadman && (_mode == DriveMode::STARTUP || _mode == DriveMode::PID)) {
         _mode                = DriveMode::STOPPING;
         _stop_start_ms       = AP_HAL::millis();
@@ -334,17 +378,38 @@ void SinglePhaseBLDC::update()
 
     switch (_mode) {
     case DriveMode::IDLE:
-        // Wait for button press, bridge stays off
+        // Wait for button press; test mode bypasses the normal startup sequence
         if (deadman) {
-            _mode = DriveMode::STARTUP;
+            _mode = _test_mode_active ? DriveMode::TEST : DriveMode::STARTUP;
         }
         break;
     case DriveMode::STARTUP:  update_startup();  break;
     case DriveMode::PID:      update_pid();      break;
     case DriveMode::STOPPING: update_stopping(); break;
+    case DriveMode::TEST:     update_test();     break;
     }
 
     blink_led(_mode == DriveMode::PID);
+
+#if AP_PERIPH_BATTERY_ENABLED
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - _batt_print_ms >= 200) {
+        _batt_print_ms = now_ms;
+        if (periph.battery_lib.healthy(0)) {
+            float current;
+            if (periph.battery_lib.current_amps(current, 0)) {
+                hal.console->printf("BATT: %.2fV %.3fA\n",
+                                    (double)periph.battery_lib.voltage(0),
+                                    (double)current);
+            } else {
+                hal.console->printf("BATT: %.2fV\n",
+                                    (double)periph.battery_lib.voltage(0));
+            }
+        }
+    }
+#endif
+
+    hal.console->printf("HALL: %.1fV\n", (double) s_last_hall);
 }
 
 void SinglePhaseBLDC::blink_led(bool on)
