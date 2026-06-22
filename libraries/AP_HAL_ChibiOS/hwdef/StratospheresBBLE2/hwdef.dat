@@ -23,9 +23,11 @@ define CH_CFG_ST_FREQUENCY 1000000
 # assume 512k flash part
 FLASH_SIZE_KB 512
 
-# console over USB CDC
-STDOUT_SERIAL SDU1
-STDOUT_BAUDRATE 57600
+# Console over USB CDC: no STDOUT_SERIAL here on purpose. Defining
+# STDOUT_SERIAL SDU1 routes printf() straight into the USB CDC queue with an
+# infinite timeout, which hangs the main thread once the buffer fills while no
+# host is attached. Without it, printf() is redirected to hal.console (the
+# OTG1 UARTDriver), which drops output when USB is not enumerated.
 
 # USB
 PA11 OTG_FS_DM OTG1
@@ -35,7 +37,7 @@ PA12 OTG_FS_DP OTG1
 SERIAL_ORDER OTG1
 
 # I2C buses
-I2C_ORDER I2C1
+I2C_ORDER I2C1 I2C3
 
 # LEDs
 # blue LED0 marked as ACT
@@ -50,13 +52,21 @@ define GPIO_TEST_LED 19
 PB11 DEADMAN_BUTTON INPUT GPIO(24)
 define GPIO_DEADMAN_BUTTON 24
 
-#SOT Hall effect
-PB15 MOTOR_A_PHASE INPUT GPIO(28)
-define GPIO_MOTOR_A_PHASE 28
-
 #THT Hall effect
-PB8 MOTOR_B_PHASE INPUT GPIO(30)
-define GPIO_MOTOR_B_PHASE 30
+PB15 MOTOR_PHASE INPUT GPIO(28)
+define GPIO_MOTOR_PHASE 28
+
+# SBUS RC input. PB13 has no USART RX alternate function on the G474, so the
+# inverted 100 kbaud SBUS stream is decoded in software: EXTI edge timestamps
+# are fed to AP_RCProtocol's SoftSerial decoder in bldc_motor.cpp.
+PB13 SBUS_IN INPUT GPIO(26)
+define GPIO_SBUS_IN 26
+
+# RC protocol library with only the SBUS backend (saves flash, avoids
+# misdetection — the pin carries SBUS only)
+define AP_RCPROTOCOL_ENABLED 1
+define AP_RCPROTOCOL_BACKEND_DEFAULT_ENABLED 0
+define AP_RCPROTOCOL_SBUS_ENABLED 1
 
 # H-bridge complementary PWM via TIM8 (160 MHz APB2 clock)
 # Leg A: PC6=AL (CH1, active-low), PC10=AH (CH1N, active-high)
@@ -74,12 +84,22 @@ PA10 USART1_RX USART1
 PB7 I2C1_SDA I2C1
 PA15 I2C1_SCL I2C1
 
-define HAL_I2C_INTERNAL_MASK 1
+# I2C3 bus
+PC11 I2C3_SDA I2C3
+PA8  I2C3_SCL I2C3
+
+define HAL_I2C_INTERNAL_MASK 3
 
 # SWD debugging
 PA13 JTMS-SWDIO SWD
 PA14 JTCK-SWCLK SWD
 
+# Motor-lead voltage sense: PA4 (package pin 12) and PA7 (package pin 15) tap
+# each motor lead through a 49.9k/2.2k divider. Both are ADC2-only channels on
+# the STM32G474 (PA4 = ADC2_IN17, PA7 = ADC2_IN4); the HAL ADC driver only
+# supports ADC1 on the G4, so they are read directly from ADC2 in
+# bldc_motor.cpp (GPIO analog mode + divider correction are handled there).
+# The HAL ADC driver stays disabled.
 define HAL_USE_ADC FALSE
 define STM32_ADC_USE_ADC1 FALSE
 define HAL_DISABLE_ADC_DRIVER TRUE
@@ -100,8 +120,12 @@ define AP_PARAM_MAX_EMBEDDED_PARAM 256
 # enable H-bridge motor driver
 define AP_PERIPH_SINGLE_PHASE_BLDC 1
 
-# enable Honeywell ABP2DANT015PG2A3XX pressure sensor on I2C1
+# Honeywell ABP2 board-mount pressure sensors (Tools/AP_Periph/abp2_pressure.*)
+#   sensor 0: I2C1 (bus 0) addr 0x28, +/-10 inH2O gauge
+#   sensor 1: I2C3 (bus 1) addr 0x28, 0..1 bar gauge
+# table fields per sensor: { bus_type, bus, address, p_min_pa, p_max_pa, type }
 define AP_PERIPH_ABP2_PRESSURE_ENABLED 1
+define HAL_PERIPH_ABP2_SENSORS { { ABP2_BUS_I2C, 0, 0x28, ABP2_INH2O(-10), ABP2_INH2O(10), ABP2_GAUGE }, { ABP2_BUS_I2C, 1, 0x28, 0.0f, ABP2_BAR(1), ABP2_GAUGE } }
 
 define AP_STATS_ENABLED 1
 
@@ -114,11 +138,14 @@ define AP_BARO_MPRLS_ENABLED 1
 define AP_PERIPH_BARO_ENABLED 1
 
 
-# INA226 battery monitor on I2C1 (bus 0), 5 mΩ shunt, addr 0x40
+# INA226 battery monitor on I2C1 (bus 0), 1 mOhm1 shunt, addr 0x40
 define AP_PERIPH_BATTERY_ENABLED 1
 define AP_BATTERY_INA2XX_ENABLED 1
 define HAL_BATT_MONITOR_DEFAULT 21
 define HAL_BATTMON_INA2XX_BUS 0
 define HAL_BATTMON_INA2XX_ADDR 0x40
-define DEFAULT_BATTMON_INA2XX_SHUNT 0.005
-define DEFAULT_BATTMON_INA2XX_MAX_AMPS 30.0
+define DEFAULT_BATTMON_INA2XX_SHUNT 0.001
+define DEFAULT_BATTMON_INA2XX_MAX_AMPS 60.0
+
+# MAX31875R2 temperature sensor on I2C1
+define AP_PERIPH_MAX31875_ENABLED 1

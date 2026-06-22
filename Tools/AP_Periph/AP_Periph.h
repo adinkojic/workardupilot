@@ -47,6 +47,8 @@
 #include "serial_options.h"
 #include "bldc_motor.h"
 #include "abp2_pressure.h"
+#include "max31875_temp.h"
+#include "solar_bms.h"
 #if AP_SIM_ENABLED
 #include <SITL/SITL.h>
 #endif
@@ -427,6 +429,15 @@ public:
 
 #if AP_PERIPH_ABP2_PRESSURE_ENABLED
     ABP2Pressure abp2_pressure;
+#endif
+
+#if AP_PERIPH_MAX31875_ENABLED
+    MAX31875Temp max31875_i2c1{0, 0x4A};  // I2C1, bus 0
+    MAX31875Temp max31875_i2c3{1, 0x4B};  // I2C3, bus 1
+#endif
+
+#if AP_PERIPH_SOLAR_BMS
+    SolarBMS solar_bms{0, 0x29};  // LT8491 on I2C1 (bus 0), addr 0x29
 #endif
 
 #if AP_PERIPH_ACTUATOR_TELEM_ENABLED

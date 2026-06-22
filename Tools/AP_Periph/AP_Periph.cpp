@@ -575,6 +575,15 @@ void AP_Periph_FW::update()
 #if AP_PERIPH_ABP2_PRESSURE_ENABLED
     abp2_pressure.update();
 #endif
+
+#if AP_PERIPH_MAX31875_ENABLED
+    max31875_i2c1.update();
+    max31875_i2c3.update();
+#endif
+
+#if AP_PERIPH_SOLAR_BMS
+    solar_bms.update();
+#endif
 }
 
 #ifdef HAL_PERIPH_LISTEN_FOR_SERIAL_UART_REBOOT_CMD_PORT

@@ -126,8 +126,10 @@ define AP_PARAM_MAX_EMBEDDED_PARAM 256
 #enable motor driver
 define AP_PERIPH_SINGLE_PHASE_BLDC 0
 
-# enable Honeywell ABP2DANT015PG2A3XX pressure sensor on I2C1
+# Honeywell ABP2DANT015PG2A3XX pressure sensor on I2C1 (bus 0), addr 0x28, 0..15 psi gauge
+# table fields per sensor: { bus_type, bus, address, p_min_pa, p_max_pa, type }
 define AP_PERIPH_ABP2_PRESSURE_ENABLED 1
+define HAL_PERIPH_ABP2_SENSORS { { ABP2_BUS_I2C, 0, 0x28, 0.0f, ABP2_PSI(15), ABP2_GAUGE } }
 
 define AP_STATS_ENABLED 1
 
