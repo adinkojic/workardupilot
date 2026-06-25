@@ -67,6 +67,39 @@
 // Runtime safety cap applied by set_throttle(). With 5 µs dead-time on a
 // 50 µs PWM period the usable upper bound for full active drive is ~0.8.
 #define MAX_THROTTLE             0.8f
+
+// Hall polarity relative to the H-bridge: the single place that maps the hall
+// pin level to the drive direction. With +1 a high hall level drives forward
+// (CC1); with -1 it drives reverse (CC2). Flip this one value if the sensor is
+// mounted or wired the other way round and the motor commutates backwards —
+// every consumer (startup kick, immediate commutation, and the phase-delayed
+// scheduler) routes through hall_dir(), so nothing else needs touching.
+#define HALL_POLARITY            (+1)
+
+// --- Commutation phase optimisation (perturb & observe) -------------------
+// The hall sensor marks a fixed electrical position, but its mechanical
+// mounting is rarely aligned with the optimum commutation instant. Rather
+// than commutate the instant a hall edge arrives (phase = 0, as the bare
+// driver did), each edge arms a one-shot timer; commutation happens when the
+// timer expires, _phase_deg electrical degrees away from the edge. Positive
+// = retard (commutate after the edge), negative = advance (before it — the
+// scheduler folds a negative offset forward by one electrical period so the
+// commutation lands just before the *next* same-polarity edge).
+//
+// _phase_deg is tuned online by a perturb-and-observe hill climb: every
+// PHASE_PO_INTERVAL_MS the objective is measured and the offset nudged one
+// step; if the objective got worse the search direction reverses. The
+// objective is electrical RPM when the throttle is externally fixed (RC
+// throttle: maximise speed) and negative duty when the RPM PID is regulating
+// (minimise the drive needed to hold the setpoint).
+#define PHASE_PO_STEP_DEG        2.0f      // perturbation per P&O step (elec deg)
+#define PHASE_PO_MIN_DEG       (-45.0f)    // search lower bound
+#define PHASE_PO_MAX_DEG         45.0f     // search upper bound
+#define PHASE_PO_INTERVAL_MS     150U      // settle + measure window per step
+#define PHASE_PO_RPM_DEADBAND    5.0f      // elec-RPM change treated as noise
+#define PHASE_PO_DUTY_DEADBAND   0.003f    // duty change treated as noise
+#define PHASE_PO_THR_STABLE      0.02f     // duty move that invalidates an RPM compare
+#define PHASE_MIN_DELAY_US       3U        // floor for the one-shot timer delay
 // --------------------------------------------------------------------------
 
 class SinglePhaseBLDC {
@@ -127,6 +160,13 @@ private:
     void update_test(void);
     void blink_led(bool on);
 
+    // Perturb-and-observe tuning of the commutation phase offset. Called once
+    // per PID tick; steps _phase_deg every PHASE_PO_INTERVAL_MS. When
+    // throttle_controlled is true the objective is electrical RPM (maximise
+    // speed at the fixed throttle); otherwise it is negative duty (minimise
+    // the drive the PID needs to hold the RPM setpoint).
+    void update_phase_po(bool throttle_controlled);
+
     // TIM8 timing: _arr = half-period in timer ticks
     //   160 MHz / (2 × 20 kHz) = 4000 → TIM8->ARR programmed as _arr - 1
     uint32_t _arr      = 4000U;
@@ -157,6 +197,20 @@ private:
     // Speed: stored as electrical RPM (matches PID / startup constants).
     // get_rpm() converts to mechanical for external consumers.
     float _electrical_rpm = 0.0f;
+
+    // Commutation phase offset (electrical degrees, signed) and its online
+    // perturb-and-observe optimiser state. _phase_deg is mirrored into the
+    // ISR-visible s_phase_deg whenever it changes; it persists across runs so
+    // a learned offset is reused on the next spin-up.
+    float    _phase_deg     = 0.0f;
+    int8_t   _po_dir        = -1;     // search direction (start by advancing)
+    bool     _po_primed     = false;  // baseline objective captured yet?
+    float    _po_last_obj   = 0.0f;   // objective from the previous window
+    float    _po_last_duty  = 0.0f;   // avg duty from the previous window
+    uint32_t _po_window_ms  = 0;      // start of the current measure window
+    float    _po_rpm_sum    = 0.0f;   // accumulators over the window
+    float    _po_duty_sum   = 0.0f;
+    uint16_t _po_samples    = 0;
 
     // PID (operates on electrical RPM)
     float    _pid_integral = 0.0f;

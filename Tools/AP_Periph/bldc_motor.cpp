@@ -39,15 +39,29 @@
 
     Operating modes:
       STARTUP – brief kick pulse (STARTUP_KICK_MS), then hall-commuted open-loop
-                spin-up until STARTUP_RPM_THRESHOLD (electrical RPM).
-      PID     – hall commutation continues in the EXTI handler; main loop runs
-                PID on electrical RPM to set duty cycle.
+                spin-up until STARTUP_RPM_THRESHOLD (electrical RPM). Commutation
+                is immediate (right at the hall edge) during startup.
+      PID     – commutation moves to a phase-delayed schedule (see below); the
+                main loop runs PID on electrical RPM (or follows RC throttle) to
+                set duty, and a perturb-and-observe loop tunes the phase offset.
 
     Hall sensor (PB15 / GPIO_MOTOR_PHASE) drives a GPIO edge interrupt (EXTI,
-    both edges) via hal.gpio->attach_interrupt(). The handler fires exactly on
-    each hall flip: it updates the H-bridge direction immediately and timestamps
-    the edge (µs) so the 1 kHz main loop can derive RPM from the inter-edge
-    interval — no polling tick and no commutation timing constraint on the loop.
+    both edges) via hal.gpio->attach_interrupt(). The handler fires on each hall
+    flip and timestamps the edge (µs) so the 1 kHz main loop can derive RPM from
+    the inter-edge interval.
+
+    Commutation phase: the bare driver commutated the instant a hall edge fired
+    (phase = 0), but the hall's mechanical mounting is rarely aligned with the
+    optimal commutation instant, which costs speed/torque. In PID mode the hall
+    edge no longer commutates directly — it arms a TIM5 one-shot (CC1 = forward,
+    CC2 = reverse) so the commutation lands a tunable offset away from the edge.
+    A positive offset retards (commutate after the edge); a negative offset
+    advances, folded forward by one electrical period so it lands just before
+    the next same-polarity edge. The offset (electrical degrees) is hill-climbed
+    online by perturb-and-observe: maximise RPM at a fixed throttle, or minimise
+    duty when the RPM PID is regulating. The hall half (high = forward-drive,
+    low = reverse-drive) is the electrical-angle state that selects which TIM5
+    channel each edge arms.
 */
 
 #include "AP_Periph.h"
@@ -61,6 +75,18 @@ extern AP_Periph_FW periph;
 
 #define TIM8_CLK_HZ     160000000UL
 #define DEFAULT_FREQ_HZ 20000UL
+
+// TIM5 is a free 32-bit general-purpose timer (APB1, 160 MHz). It runs as a
+// free-running up-counter at the full 160 MHz (PSC = 0 → 6.25 ns/tick) and
+// provides the two one-shot compares that schedule phase-delayed commutation:
+//   CC1 → forward commutation (armed on the rising hall edge)
+//   CC2 → reverse commutation (armed on the falling hall edge)
+// Two independent channels are needed so an advanced (negative) phase, which
+// folds forward by one electrical period, can keep a forward and a reverse
+// commutation pending at the same time. The handler is suppressed by the
+// ChibiOS HAL (STM32_TIM5_SUPPRESS_ISR), so the vector is ours to define.
+#define TIM5_CLK_HZ            160000000UL
+#define PHASE_MIN_DELAY_TICKS ((PHASE_MIN_DELAY_US) * (TIM5_CLK_HZ / 1000000UL))
 // DTG field is 8-bit non-linear: DTG[7:5]=111 → DT = (32 + DTG[4:0]) × 16 × t_DTS
 // 0xF2 = (32+18)×16×6.25 ns = 5000 ns @ 160 MHz
 #define DEAD_TIME_TICKS 0xF2U
@@ -86,10 +112,23 @@ static const uint32_t BDTR_BASE = TIM_BDTR_OSSR | TIM_BDTR_OSSI | DEAD_TIME_TICK
 
 static volatile uint32_t s_half_period_us = 0;     // µs between the last two hall edges
 static volatile uint32_t s_last_edge_us   = 0;     // micros() timestamp of most recent edge
-static volatile bool     s_commutate_en   = false; // ISR commutation active
+static volatile bool     s_commutate_en   = false; // immediate (startup) commutation active
 static volatile int8_t   s_direction      = 1;     // current H-bridge polarity
 static volatile float    s_throttle_v     = 0.0f;  // mirrored for ISR
 static volatile uint32_t s_arr_v          = 4000U; // mirrored for ISR
+
+// Phase-delayed commutation (PID mode). When s_phase_en is set the hall EXTI
+// handler stops commutating inline; instead each edge arms a TIM5 one-shot so
+// the actual commutation lands s_phase_frac × (half electrical period) away
+// from the edge. s_phase_frac = phase_deg / 180, signed (negative = advance,
+// folded forward by one electrical period). s_last_edge_ticks is the TIM5
+// count at the previous edge; the inter-edge tick count is the half period at
+// full timer resolution. s_phase_primed gates the first edge, which only
+// establishes a baseline tick count (no half period to schedule from yet).
+static volatile bool     s_phase_en        = false;
+static volatile bool     s_phase_primed    = false;
+static volatile float    s_phase_frac      = 0.0f;
+static volatile uint32_t s_last_edge_ticks = 0;
 
 // SBUS edge capture (PB13). The EXTI handler measures the width of each
 // completed high/low state and queues (high, low) pairs in a single-producer
@@ -108,6 +147,57 @@ static volatile uint16_t s_sbus_tail    = 0;   // main-loop read index
 static volatile uint32_t s_sbus_edge_us = 0;   // timestamp of previous edge
 static volatile uint32_t s_sbus_high_us = 0;   // width of last completed high state
 
+// Hall level → drive direction, gated by the single HALL_POLARITY constant.
+// This is the one mapping used everywhere commutation direction is derived from
+// the hall (startup kick, immediate commutation, phase scheduler), so flipping
+// HALL_POLARITY reverses the sensor relationship for all of them at once.
+static inline int8_t hall_dir(bool pin_state)
+{
+    return (int8_t)((pin_state ? 1 : -1) * HALL_POLARITY);
+}
+
+// Drive the H-bridge for the given direction at the current mirrored duty.
+// This is the actual commutation primitive: it writes the CCR1 phasing and
+// the B-leg static rail for `dir`. Called from the TIM5 one-shot ISR (phase
+// mode) and, inline, from the hall handler (immediate startup mode). Kept in
+// RAM so commutation latency is not at the mercy of flash wait states.
+__RAMFUNC__ static inline void commutate_now(int8_t dir)
+{
+    s_direction = dir;
+    const uint32_t arr  = s_arr_v;
+    const uint32_t duty = (uint32_t)(s_throttle_v * arr);
+    if (dir > 0) {
+        TIM8->CCR1  = arr - duty;
+        TIM8->CCMR2 = CCMR2_FWD_STATIC;
+    } else {
+        TIM8->CCR1  = duty;
+        TIM8->CCMR2 = CCMR2_REV_STATIC;
+    }
+}
+
+// TIM5 compare ISR — fires when a scheduled commutation instant is reached.
+// CC1 = forward, CC2 = reverse. Each match clears its own flag and commutates.
+// The compares are inherently one-shot: with a free-running 32-bit counter a
+// target is not revisited for ~27 s, so the channel simply waits, disarmed in
+// effect, until the hall handler writes a fresh target. Both compare interrupts
+// stay permanently enabled (armed/disarmed at the register level only by the
+// main loop), so this ISR never touches DIER and cannot race the hall handler.
+CH_IRQ_HANDLER(STM32_TIM5_HANDLER);
+CH_IRQ_HANDLER(STM32_TIM5_HANDLER)
+{
+    CH_IRQ_PROLOGUE();
+    const uint32_t sr = TIM5->SR & TIM5->DIER;
+    if (sr & TIM_SR_CC1IF) {
+        TIM5->SR = ~TIM_SR_CC1IF;
+        commutate_now(1);
+    }
+    if (sr & TIM_SR_CC2IF) {
+        TIM5->SR = ~TIM_SR_CC2IF;
+        commutate_now(-1);
+    }
+    CH_IRQ_EPILOGUE();
+}
+
 // Hall-edge EXTI handler — runs in GPIO interrupt context, once per hall flip.
 // `pin_state` is the hall level latched at the edge and `now_us` is the
 // interrupt timestamp in microseconds; both are supplied by the HAL functor
@@ -121,21 +211,55 @@ void SinglePhaseBLDC::hall_irq(uint8_t pin, bool pin_state, uint32_t now_us)
     }
     s_last_edge_us = now_us;
 
+    // Phase-delayed commutation: arm a TIM5 one-shot instead of commutating
+    // here. The hall edge is a known electrical landmark; hall_dir() maps the
+    // edge to the drive direction it commands (and thus which compare channel),
+    // and the commutation is scheduled at an offset of s_phase_frac × (half
+    // electrical period) from the edge.
+    if (s_phase_en) {
+        const uint32_t cnt        = TIM5->CNT;
+        const uint32_t half_ticks = cnt - s_last_edge_ticks;   // 180° in TIM5 ticks
+        s_last_edge_ticks = cnt;
+
+        // First edge after enabling only establishes the baseline tick count;
+        // there is no measured half period to schedule from yet.
+        if (!s_phase_primed) {
+            s_phase_primed = true;
+            return;
+        }
+
+        float delay_f = s_phase_frac * (float)half_ticks;
+        if (delay_f < 0.0f) {
+            // Negative (advance): fold forward by one full electrical period so
+            // the commutation lands just before the next same-polarity edge.
+            delay_f += 2.0f * (float)half_ticks;
+        }
+        uint32_t delay = (uint32_t)delay_f;
+        if (delay < PHASE_MIN_DELAY_TICKS) {
+            delay = PHASE_MIN_DELAY_TICKS;
+        }
+        const uint32_t target = cnt + delay;
+
+        // Arm the channel for the direction this edge commands (CC1 = forward,
+        // CC2 = reverse): set the absolute compare target and clear any stale
+        // flag. The compare interrupt is already enabled (see update_pid), so no
+        // DIER read-modify-write here — nothing for the TIM5 ISR to race.
+        if (hall_dir(pin_state) > 0) {
+            TIM5->CCR1 = target;
+            TIM5->SR   = ~TIM_SR_CC1IF;
+        } else {
+            TIM5->CCR2 = target;
+            TIM5->SR   = ~TIM_SR_CC2IF;
+        }
+        return;
+    }
+
     if (!s_commutate_en) {
         return;
     }
 
-    // Same direction logic as before: hall high → forward, hall low → reverse.
-    s_direction = pin_state ? 1 : -1;
-    uint32_t arr  = s_arr_v;
-    uint32_t duty = (uint32_t)(s_throttle_v * arr);
-    if (s_direction > 0) {
-        TIM8->CCR1  = arr - duty;
-        TIM8->CCMR2 = CCMR2_FWD_STATIC;
-    } else {
-        TIM8->CCR1  = duty;
-        TIM8->CCMR2 = CCMR2_REV_STATIC;
-    }
+    // Immediate (startup) commutation, direction from the hall via hall_dir().
+    commutate_now(hall_dir(pin_state));
 }
 
 // SBUS-edge EXTI handler — fires on both edges of the SBUS stream (PB13).
@@ -292,6 +416,33 @@ static void tim8_init(uint32_t arr)
     TIM8->CR1 |= TIM_CR1_CEN;
 }
 
+// Free-running 32-bit time base for the one-shot commutation compares. PSC = 0
+// (160 MHz, 6.25 ns/tick), ARR = full range so the counter never reloads — the
+// commutation instants are absolute compare targets (CNT + delay). CC1/CC2 are
+// left in frozen output-compare mode (CCMR1 = 0): no pin output, but a match
+// still raises CCxIF and, when armed via DIER, the TIM5 interrupt. Compares are
+// armed per-edge by the hall handler and disarmed in the ISR (one-shot).
+static void tim5_init()
+{
+    rccEnableTIM5(true);
+
+    TIM5->CR1  = 0;
+    TIM5->CR2  = 0;
+    TIM5->SMCR = 0;
+    TIM5->DIER = 0;
+    TIM5->CCMR1 = 0;          // CC1/CC2 = output compare, frozen
+    TIM5->CCER  = 0;          // no physical outputs
+    TIM5->PSC   = 0;
+    TIM5->ARR   = 0xFFFFFFFFU;
+    TIM5->CCR1  = 0;
+    TIM5->CCR2  = 0;
+    TIM5->EGR   = TIM_EGR_UG;
+    TIM5->SR    = 0;
+    TIM5->CR1  |= TIM_CR1_CEN;
+
+    nvicEnableVector(STM32_TIM5_NUMBER, CORTEX_MAX_KERNEL_PRIORITY);
+}
+
 // ---------------------------------------------------------------------------
 // Motor-lead voltage sense (ADC2, polled)
 //
@@ -367,6 +518,7 @@ void SinglePhaseBLDC::init()
     _arr    = TIM8_CLK_HZ / (2U * DEFAULT_FREQ_HZ);
     s_arr_v = _arr;
     tim8_init(_arr);
+    tim5_init();   // 32-bit time base for phase-delayed commutation
     apply_pwm(0.0f);
 
     // Hall sensor drives commutation directly via a GPIO edge interrupt — the
@@ -400,7 +552,20 @@ void SinglePhaseBLDC::set_enabled(bool en)
 
 void SinglePhaseBLDC::set_throttle(float throttle)
 {
-    apply_pwm(constrain_float(throttle, 0.0f, MAX_THROTTLE));
+    throttle = constrain_float(throttle, 0.0f, MAX_THROTTLE);
+    if (s_phase_en) {
+        // Phase-commutation owns the TIM8 CCR1/CCMR2 phasing (the TIM5 ISR sets
+        // it for the current direction at each commutation). Writing those
+        // registers from here would race that ISR — at high commutation rates a
+        // stale direction could be latched for a whole main-loop tick. So just
+        // hand the new duty to the ISR via the mirrors; it takes effect at the
+        // next commutation (well under a millisecond away in PID mode).
+        _throttle    = throttle;
+        s_arr_v      = _arr;
+        s_throttle_v = throttle;
+        return;
+    }
+    apply_pwm(throttle);
 }
 
 void SinglePhaseBLDC::set_frequency(uint32_t hz)
@@ -459,7 +624,9 @@ void SinglePhaseBLDC::update_startup()
         _commute_active      = false;
         _kick_attempts       = 0;
         s_commutate_en       = false;
-        s_direction          = (palReadLine(HALL_LINE) != 0) ? 1 : -1;
+        s_direction          = hall_dir(palReadLine(HALL_LINE) != 0);
+        // Raw level (not direction) — used only to detect that the rotor moved,
+        // so it is independent of HALL_POLARITY.
         _hall_at_kick_start  = (palReadLine(HALL_LINE) != 0);
     }
 
@@ -518,9 +685,27 @@ void SinglePhaseBLDC::update_startup()
 
 void SinglePhaseBLDC::update_pid()
 {
-    // ISR continues handling commutation; PID controls duty cycle only
-    s_commutate_en = true;
+    // First PID tick: hand commutation from the immediate startup path over to
+    // the phase-delayed TIM5 scheduler and seed the P&O search. _phase_deg
+    // persists across runs, so this resumes from the last learned offset.
+    if (!s_phase_en) {
+        s_commutate_en = false;            // stop immediate commutation
+        s_phase_primed = false;            // first edge re-bases the tick count
+        s_phase_frac   = _phase_deg * (1.0f / 180.0f);
+        // Arm both TIM5 compare interrupts (clear stale flags first). They stay
+        // enabled for the whole PID run; the hall handler only writes targets.
+        TIM5->SR   = ~(TIM_SR_CC1IF | TIM_SR_CC2IF);
+        TIM5->DIER = TIM_DIER_CC1IE | TIM_DIER_CC2IE;
+        s_phase_en     = true;
+        _po_primed     = false;
+        _po_rpm_sum    = 0.0f;
+        _po_duty_sum   = 0.0f;
+        _po_samples    = 0;
+        _po_window_ms  = AP_HAL::millis();
+    }
     set_enabled(true);
+
+    bool throttle_controlled;
 
     // RC link up → throttle channel commands the duty directly, no RPM PID.
     // Keep _pid_last_us current so dt stays sane if the link drops and the
@@ -528,30 +713,100 @@ void SinglePhaseBLDC::update_pid()
     if (rc_link_ok() && _rc_num_channels >= SBUS_THROTTLE_CHANNEL) {
         set_throttle(rc_throttle());
         _pid_last_us = AP_HAL::micros();
+        throttle_controlled = true;        // duty fixed externally → maximise RPM
+    } else {
+        throttle_controlled = false;       // PID regulates speed → minimise duty
+
+        uint32_t now_us = AP_HAL::micros();
+        float dt = (now_us - _pid_last_us) * 1e-6f;
+        _pid_last_us = now_us;
+
+        if (dt > 0.0f && dt <= 0.5f) {
+            float err      = TARGET_RPM - _electrical_rpm;
+            _pid_integral += err * dt;
+            _pid_integral  = constrain_float(_pid_integral,
+                                             -PID_INTEGRAL_MAX, PID_INTEGRAL_MAX);
+            float deriv    = (err - _pid_last_err) / dt;
+            _pid_last_err  = err;
+
+            float duty = PID_KP * err + PID_KI * _pid_integral + PID_KD * deriv;
+            set_throttle(duty);  // public setter applies the MAX_THROTTLE safety cap
+        }
+    }
+
+    // Continuously retune the commutation phase toward the best operating point.
+    update_phase_po(throttle_controlled);
+}
+
+// Perturb-and-observe hill climb on the commutation phase offset. Runs once per
+// PID tick, accumulating RPM and duty; every PHASE_PO_INTERVAL_MS it evaluates
+// the objective for the window just elapsed, nudges _phase_deg one step in the
+// current search direction, and reverses that direction whenever the objective
+// got worse. The objective is electrical RPM when the throttle is fixed (climb
+// toward maximum speed) and negative duty when the RPM PID is regulating (climb
+// toward the least drive that still holds the setpoint).
+void SinglePhaseBLDC::update_phase_po(bool throttle_controlled)
+{
+    const uint32_t now = AP_HAL::millis();
+
+    _po_rpm_sum  += _electrical_rpm;
+    _po_duty_sum += _throttle;
+    _po_samples++;
+
+    if (now - _po_window_ms < PHASE_PO_INTERVAL_MS || _po_samples == 0) {
         return;
     }
 
-    uint32_t now_us = AP_HAL::micros();
-    float dt = (now_us - _pid_last_us) * 1e-6f;
-    _pid_last_us = now_us;
+    const float inv      = 1.0f / (float)_po_samples;
+    const float avg_rpm  = _po_rpm_sum  * inv;
+    const float avg_duty = _po_duty_sum * inv;
+    _po_rpm_sum   = 0.0f;
+    _po_duty_sum  = 0.0f;
+    _po_samples   = 0;
+    _po_window_ms = now;
 
-    if (dt <= 0.0f || dt > 0.5f) {
+    // Pick the objective to maximise. With a fixed throttle (RC), or when the
+    // RPM PID has saturated the duty (setpoint unreachable, so it can no longer
+    // trade duty for phase), the meaningful objective is speed. Only while the
+    // PID is genuinely regulating below the cap does minimising duty make sense.
+    const bool  maximise_rpm = throttle_controlled ||
+                               (avg_duty >= MAX_THROTTLE - 0.01f);
+    const float obj      = maximise_rpm ? avg_rpm : -avg_duty;
+    const float deadband = maximise_rpm ? PHASE_PO_RPM_DEADBAND
+                                        : PHASE_PO_DUTY_DEADBAND;
+
+    // In throttle-controlled mode the operator can move the throttle between
+    // windows, which would swamp the small RPM change a phase step produces.
+    // If the commanded duty shifted, treat this window as a fresh baseline
+    // rather than a valid comparison and skip the perturbation.
+    if (throttle_controlled &&
+        fabsf(avg_duty - _po_last_duty) > PHASE_PO_THR_STABLE) {
+        _po_last_duty = avg_duty;
+        _po_last_obj  = obj;
+        _po_primed    = true;
         return;
     }
+    _po_last_duty = avg_duty;
 
-    float err      = TARGET_RPM - _electrical_rpm;
-    _pid_integral += err * dt;
-    _pid_integral  = constrain_float(_pid_integral,
-                                     -PID_INTEGRAL_MAX, PID_INTEGRAL_MAX);
-    float deriv    = (err - _pid_last_err) / dt;
-    _pid_last_err  = err;
+    if (!_po_primed) {
+        _po_primed = true;                 // first window: baseline only
+    } else if (obj < _po_last_obj - deadband) {
+        _po_dir = -_po_dir;                // got worse → reverse the search
+    }
+    _po_last_obj = obj;
 
-    float duty = PID_KP * err + PID_KI * _pid_integral + PID_KD * deriv;
-    set_throttle(duty);  // public setter applies the MAX_THROTTLE safety cap
+    _phase_deg = constrain_float(_phase_deg + _po_dir * PHASE_PO_STEP_DEG,
+                                 PHASE_PO_MIN_DEG, PHASE_PO_MAX_DEG);
+    s_phase_frac = _phase_deg * (1.0f / 180.0f);
 }
 
 void SinglePhaseBLDC::update_stopping()
 {
+    // Disarm the phase scheduler before dropping the bridge so a pending TIM5
+    // compare can't commutate after the H-bridge is disabled. Plain write: the
+    // only other DIER writer is update_pid, also main-loop context.
+    s_phase_en = false;
+    TIM5->DIER = 0;
     apply_pwm(0.0f);
     set_enabled(false);
     s_commutate_en       = false;
@@ -678,11 +933,12 @@ void SinglePhaseBLDC::update()
 
     if (now_ms - _batt_print_ms >= 200) {
         _batt_print_ms = now_ms;
-        hal.console->printf("Mode: %-8s kicks=%u  Mech RPM: %.1f  Thr: %.3f  I: %.3fA  V: %.2fV  RC ch%u: %u(%s)  thr ch%u: %.2f\n",
+        hal.console->printf("Mode: %-8s kicks=%u  Mech RPM: %.1f  Thr: %.3f  Phase: %.1fdeg  I: %.3fA  V: %.2fV  RC ch%u: %u(%s)  thr ch%u: %.2f\n",
                             mode_name(_mode),
                             (unsigned)_kick_attempts,
                             (double)_peak_mech_rpm,
                             (double)_peak_throttle,
+                            (double)_phase_deg,
                             (double)_peak_current,
                             (double)_volt_at_peak_current,
                             (unsigned)SBUS_MOTOR_CHANNEL,
