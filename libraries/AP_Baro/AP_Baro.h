@@ -268,6 +268,7 @@ private:
         PROBE_MSP   =(1<<12),
         PROBE_BMP581=(1<<13),
         PROBE_AUAV  =(1<<14),
+        PROBE_ABP2  =(1<<15),
     };
     
 #if HAL_BARO_WIND_COMP_ENABLED

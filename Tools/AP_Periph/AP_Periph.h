@@ -46,9 +46,9 @@
 #include "networking.h"
 #include "serial_options.h"
 #include "bldc_motor.h"
-#include "abp2_pressure.h"
-#include "max31875_temp.h"
-#include "solar_bms.h"
+//#include "abp2_pressure.h"
+//#include "max31875_temp.h"
+//#include "solar_bms.h"
 #if AP_SIM_ENABLED
 #include <SITL/SITL.h>
 #endif

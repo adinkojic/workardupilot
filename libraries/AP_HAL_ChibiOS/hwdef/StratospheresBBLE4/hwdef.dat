@@ -48,9 +48,13 @@ define HAL_LED_ON 1
 PB2 TEST_LED OUTPUT LOW GPIO(19)
 define GPIO_TEST_LED 19
 
+# Output pin, used for Simulated hall
+PB12 SIM_HALL OUTPUT HIGH
+define GPIO_SIM_HALL 25
+
 #deadman button, low pressed
-PB11 DEADMAN_BUTTON INPUT GPIO(24)
-define GPIO_DEADMAN_BUTTON 24
+PB13 DEADMAN_BUTTON INPUT GPIO(26)
+define GPIO_DEADMAN_BUTTON 26
 
 #THT Hall effect
 PB15 MOTOR_PHASE INPUT GPIO(28)
@@ -59,8 +63,8 @@ define GPIO_MOTOR_PHASE 28
 # SBUS RC input. PB13 has no USART RX alternate function on the G474, so the
 # inverted 100 kbaud SBUS stream is decoded in software: EXTI edge timestamps
 # are fed to AP_RCProtocol's SoftSerial decoder in bldc_motor.cpp.
-PB13 SBUS_IN INPUT GPIO(26)
-define GPIO_SBUS_IN 26
+PB11 SBUS_IN INPUT GPIO(24)
+define GPIO_SBUS_IN 24
 
 # RC protocol library with only the SBUS backend (saves flash, avoids
 # misdetection — the pin carries SBUS only)
@@ -145,7 +149,7 @@ define HAL_BATT_MONITOR_DEFAULT 21
 define HAL_BATTMON_INA2XX_BUS 0
 define HAL_BATTMON_INA2XX_ADDR 0x40
 define DEFAULT_BATTMON_INA2XX_SHUNT 0.001
-define DEFAULT_BATTMON_INA2XX_MAX_AMPS 60.0
+define DEFAULT_BATTMON_INA2XX_MAX_AMPS 80.0
 
 # MAX31875R2 temperature sensor on I2C1
 define AP_PERIPH_MAX31875_ENABLED 0

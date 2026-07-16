@@ -58,6 +58,7 @@ public:
         DEVTYPE_BARO_AUAV     = 0x17,
         DEVTYPE_BARO_MS5837_02BA = 0x18,
         DEVTYPE_BARO_MPRLS    = 0x19,
+        DEVTYPE_BARO_ABP2     = 0x1A,
     };
 
 protected:

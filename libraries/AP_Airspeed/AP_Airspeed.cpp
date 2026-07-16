@@ -44,6 +44,7 @@
 #include <utility>
 #include "AP_Airspeed_MS4525.h"
 #include "AP_Airspeed_MS5525.h"
+#include "AP_Airspeed_ABP2.h"
 #include "AP_Airspeed_SDP3X.h"
 #include "AP_Airspeed_DLVR.h"
 #include "AP_Airspeed_analog.h"
@@ -475,6 +476,11 @@ void AP_Airspeed::allocate()
             sensor[i] = NEW_NOTHROW AP_Airspeed_AUAV(*this, i, 30);
             break;
 #endif  // AP_AIRSPEED_AUAV_ENABLED
+#if AP_AIRSPEED_ABP2_ENABLED
+        case TYPE_I2C_ABP2:
+            sensor[i] = NEW_NOTHROW AP_Airspeed_ABP2(*this, i);
+            break;
+#endif  // AP_AIRSPEED_ABP2_ENABLED
         }
         if (sensor[i] && !sensor[i]->init()) {
             GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Airspeed %u init failed", i + 1);

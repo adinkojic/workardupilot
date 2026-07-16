@@ -18,7 +18,14 @@
 #define STARTUP_REST_MS          10U       // bridge-off gap between pulses (ms)
 #define STARTUP_MAX_KICKS        50U       // give up if rotor never moves
 #define STARTUP_COMMUTE_THROTTLE 0.25f      // duty during hall-commuted spin-up
-#define STARTUP_RPM_THRESHOLD    500.0f    // electrical RPM to enter PID mode
+// Handoff speed to PID (pulse-width) mode. Keep this high enough that the
+// pulse drive is safe when it takes over: pulses apply full rail voltage with
+// no chop, so back-EMF has to be doing the current limiting. At 50k eRPM the
+// half period is 600 µs and the widest ON window (0.8 × 300 µs = 240 µs) sits
+// just under PULSE_MAX_ON_US — below this speed the cap would strangle the
+// drive anyway, and the winding current of an uncapped pulse would only be
+// limited by the winding resistance.
+#define STARTUP_RPM_THRESHOLD    50000.0f  // electrical RPM to enter PID mode
 
 #define TARGET_RPM               500000.0f // electrical RPM PID setpoint
 #define PID_KP                   0.002f
@@ -46,8 +53,37 @@
 #define SBUS_THROTTLE_IN_MIN     1000U     // µs mapped to OUT_MIN duty
 #define SBUS_THROTTLE_IN_MAX     2000U     // µs mapped to OUT_MAX duty
 #define SBUS_THROTTLE_OUT_MIN    0.10f
-#define SBUS_THROTTLE_OUT_MAX    0.80f
+#define SBUS_THROTTLE_OUT_MAX    0.98f
 #define SBUS_TIMEOUT_MS          200U      // no frame for this long → off
+
+// --- Simulation mode (SBUS channel 5 high) ---------------------------------
+// With channel 5 above the threshold the real hall sensor is disconnected from
+// the control path and replaced by a simulated rotor, while the H-bridge stays
+// fully live — so the whole drive stack (startup kicks, hall-commutated
+// spin-up, pulse scheduler, PID) can be exercised and scoped with no motor
+// attached. The rotor model matches the observed motor: 4 pole pairs → 8 hall
+// edges (45° each) per mechanical rev, ~69600 RPM at ~50% throttle on 33 V,
+// ~200 ms spin-up, ~500 ms coast-down. If a large battery current is seen
+// while simulating (a real motor was left connected and just started), the
+// drive is stopped and locked out for SIM_FAULT_DISABLE_MS with the LED
+// flashing rapidly. All of this is simulation-only — nothing changes when
+// channel 5 is low.
+#define SBUS_SIM_CHANNEL         5U        // 1-based channel enabling simulation
+#define SBUS_SIM_THRESHOLD_US    1700U     // channel above this = simulate
+// Steady-state speed scales linearly with throttle: 69600 mech RPM observed
+// at ~50% throttle on 33 V → 139200 RPM per unit throttle.
+#define SIM_RPM_PER_THROTTLE     139200.0f
+#define SIM_ACCEL_TAU_S          0.10f     // spin-up time constant (~200 ms to 60k)
+#define SIM_DECEL_RPM_PER_S      139200.0f // coast-down (69600 → 0 in ~500 ms)
+// Above this speed simulated hall edges are chained by the TIM5 CC3 compare
+// ISR (at 69600 RPM edges come at 9.3 kHz — far beyond the 1 kHz main loop);
+// below it the main loop emits edges from the integrated rotor angle so slow
+// motion (the startup kicks) advances the hall realistically.
+#define SIM_ISR_HANDOFF_RPM      3000.0f
+#define SIM_FAULT_CURRENT_A      2.0f      // battery amps while simulating ⇒ motor connected
+#define SIM_FAULT_DISABLE_MS     10000U    // lockout after a simulation current fault
+#define SIM_HALL_FAKE_PIN        0xFFU     // pin id marking simulated hall_irq calls
+// ----------------------------------------------------------------------------
 
 // Motor-lead voltage sense divider: each lead taps the ADC pin through a 49.9k
 // (top) / 2.2k (bottom) divider. The ADC measures the divided pin voltage;
@@ -72,34 +108,34 @@
 // pin level to the drive direction. With +1 a high hall level drives forward
 // (CC1); with -1 it drives reverse (CC2). Flip this one value if the sensor is
 // mounted or wired the other way round and the motor commutates backwards —
-// every consumer (startup kick, immediate commutation, and the phase-delayed
+// every consumer (startup kick, immediate commutation, and the pulse-width
 // scheduler) routes through hall_dir(), so nothing else needs touching.
 #define HALL_POLARITY            (+1)
 
-// --- Commutation phase optimisation (perturb & observe) -------------------
-// The hall sensor marks a fixed electrical position, but its mechanical
-// mounting is rarely aligned with the optimum commutation instant. Rather
-// than commutate the instant a hall edge arrives (phase = 0, as the bare
-// driver did), each edge arms a one-shot timer; commutation happens when the
-// timer expires, _phase_deg electrical degrees away from the edge. Positive
-// = retard (commutate after the edge), negative = advance (before it — the
-// scheduler folds a negative offset forward by one electrical period so the
-// commutation lands just before the *next* same-polarity edge).
-//
-// _phase_deg is tuned online by a perturb-and-observe hill climb: every
-// PHASE_PO_INTERVAL_MS the objective is measured and the offset nudged one
-// step; if the objective got worse the search direction reverses. The
-// objective is electrical RPM when the throttle is externally fixed (RC
-// throttle: maximise speed) and negative duty when the RPM PID is regulating
-// (minimise the drive needed to hold the setpoint).
-#define PHASE_PO_STEP_DEG        2.0f      // perturbation per P&O step (elec deg)
-#define PHASE_PO_MIN_DEG       (-45.0f)    // search lower bound
-#define PHASE_PO_MAX_DEG         45.0f     // search upper bound
-#define PHASE_PO_INTERVAL_MS     150U      // settle + measure window per step
-#define PHASE_PO_RPM_DEADBAND    5.0f      // elec-RPM change treated as noise
-#define PHASE_PO_DUTY_DEADBAND   0.003f    // duty change treated as noise
-#define PHASE_PO_THR_STABLE      0.02f     // duty move that invalidates an RPM compare
-#define PHASE_MIN_DELAY_US       3U        // floor for the one-shot timer delay
+// --- Pulse-width drive (post-startup) -------------------------------------
+// Once spun up the driver stops chopping the current. The hall handler keeps a
+// rolling average of the half period (one hall pulse width) over the last
+// SPEED_AVG_CYCLES edges and, on each edge, schedules a single H-bridge pulse
+// via two TIM5 one-shots:
+//   - it turns ON  1/4 pulse width (= 1/8 electrical cycle) after the edge,
+//     plus a fixed PULSE_DELAY_OFFSET_US,
+//   - it stays ON for (throttle × 1/2 pulse width),
+// so throttle sweeps the drive window across the middle 50% of each hall
+// pulse. The bridge is fully active (no PWM chop) for the window and disabled
+// (MOE off, winding floating) the rest of the time. Both edges arm a fresh
+// single-shot, so if edges stop the bridge simply stays disabled; after
+// PULSE_STOP_TIMEOUT_MS with no edge the driver returns to IDLE.
+#define SPEED_AVG_CYCLES         8U        // half-periods in the rolling speed average
+#define PULSE_DELAY_OFFSET_US    0         // extra hall-edge → H-bridge-ON delay
+// Hard ceiling on a single unchopped ON window. The pulse drive applies full
+// rail voltage, so on a slow rotor (little back-EMF) the winding current is
+// limited only by resistance and rises with L/R towards V_bus/R — long pulses
+// are what kill MOSFETs. 250 µs is generous next to the ~24 µs ON window at
+// TARGET_RPM but bounds the damage from a bad speed estimate or an early
+// handoff. Size it against the winding L/R and the FET pulsed-current rating.
+#define PULSE_MAX_ON_US          250U
+#define PULSE_STOP_TIMEOUT_MS    1000U     // no hall edge this long → back to IDLE
+#define PULSE_STOP_TIMEOUT_US    (PULSE_STOP_TIMEOUT_MS * 1000U)
 // --------------------------------------------------------------------------
 
 class SinglePhaseBLDC {
@@ -122,6 +158,11 @@ public:
     // Enable H-bridge test mode: hold button = bridge on, release = off,
     // each press flips direction. Overrides normal STARTUP/PID flow.
     void  set_test_mode(bool en) { _test_mode_active = en; }
+
+    // Simulated hall edge generator, called from the TIM5 CC3 compare ISR
+    // (a free function, hence public static). Toggles the simulated hall
+    // level, feeds it to hall_irq() and chains the next edge.
+    static void sim_hall_edge_isr(void);
 
 private:
     void apply_pwm(float duty);   // [0, 1] — writes CCR1 + CCMR2, no safety cap
@@ -160,12 +201,14 @@ private:
     void update_test(void);
     void blink_led(bool on);
 
-    // Perturb-and-observe tuning of the commutation phase offset. Called once
-    // per PID tick; steps _phase_deg every PHASE_PO_INTERVAL_MS. When
-    // throttle_controlled is true the objective is electrical RPM (maximise
-    // speed at the fixed throttle); otherwise it is negative duty (minimise
-    // the drive the PID needs to hold the RPM setpoint).
-    void update_phase_po(bool throttle_controlled);
+    // Hall level as seen by the control logic — the simulated level while
+    // simulation is active, the real pin otherwise. The startup state machine
+    // reads the hall through this so simulation only swaps the data source.
+    bool read_hall(void) const;
+
+    // Simulation engine (main loop, 1 kHz): handles entry/exit on the SBUS
+    // request, integrates the rotor model and emits/chains fake hall edges.
+    void update_simulation(bool requested);
 
     // TIM8 timing: _arr = half-period in timer ticks
     //   160 MHz / (2 × 20 kHz) = 4000 → TIM8->ARR programmed as _arr - 1
@@ -188,6 +231,15 @@ private:
     bool _test_mode_active = false;
     bool _prev_deadman     = false;
 
+    // Simulation mode — rotor model state, main-loop only (the ISR-shared
+    // pieces are file statics in bldc_motor.cpp)
+    bool     _sim_active     = false;
+    float    _sim_mech_rpm   = 0.0f;   // simulated mechanical RPM
+    float    _sim_angle_deg  = 0.0f;   // simulated rotor angle [0, 360)
+    float    _sim_edge_accum = 0.0f;   // degrees since the last emitted edge
+    uint32_t _sim_last_us    = 0;      // model integration timestamp
+    uint32_t _sim_fault_ms   = 0;      // 0 = no fault; else millis() at trigger
+
     // SBUS RC input — channels latched from AP_RCProtocol on each new frame
     uint16_t _rc_channels[MAX_RCIN_CHANNELS] = {};
     uint8_t  _rc_num_channels = 0;
@@ -197,20 +249,6 @@ private:
     // Speed: stored as electrical RPM (matches PID / startup constants).
     // get_rpm() converts to mechanical for external consumers.
     float _electrical_rpm = 0.0f;
-
-    // Commutation phase offset (electrical degrees, signed) and its online
-    // perturb-and-observe optimiser state. _phase_deg is mirrored into the
-    // ISR-visible s_phase_deg whenever it changes; it persists across runs so
-    // a learned offset is reused on the next spin-up.
-    float    _phase_deg     = 0.0f;
-    int8_t   _po_dir        = -1;     // search direction (start by advancing)
-    bool     _po_primed     = false;  // baseline objective captured yet?
-    float    _po_last_obj   = 0.0f;   // objective from the previous window
-    float    _po_last_duty  = 0.0f;   // avg duty from the previous window
-    uint32_t _po_window_ms  = 0;      // start of the current measure window
-    float    _po_rpm_sum    = 0.0f;   // accumulators over the window
-    float    _po_duty_sum   = 0.0f;
-    uint16_t _po_samples    = 0;
 
     // PID (operates on electrical RPM)
     float    _pid_integral = 0.0f;
